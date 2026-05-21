@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
 google-harness-bridge: OpenAI-compatible HTTP → harness WebSocket proxy.
-
-Usage:
-  GEMINI_API_KEY=xxx python3 harness-bridge.py
-  
-OpenClaw config:
-  models.providers["google-harness"] = {
-    baseUrl: "http://127.0.0.1:8080"
-  }
-  # Then: openclaw models set google-harness/google-harness
-  # Or use as a custom provider
+Supports both streaming (SSE) and non-streaming responses.
 """
-import asyncio, json, os, signal, struct, subprocess, sys
+import asyncio, json, os, struct, subprocess, sys
 import websockets
 from google.protobuf import json_format
 import google.antigravity.connections.local.localharness_pb2 as pb
@@ -27,19 +18,13 @@ class HarnessSession:
     def __init__(self, api_key: str, model: str = "gemini-3.5-flash"):
         self.api_key = api_key
         self.model = model
-        self.process: subprocess.Popen | None = None
+        self.process = None
         self.ws = None
     
     async def start(self):
-        """Launch harness and establish WebSocket."""
-        import subprocess as _sp
-        self.process = _sp.Popen(
-            [BINARY],
-            stdin=_sp.PIPE,
-            stdout=_sp.PIPE,
-            stderr=_sp.DEVNULL,  # Prevent stderr pipe buffer deadlock
+        self.process = subprocess.Popen(
+            [BINARY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        
         ic = pb.InputConfig(storage_directory="/tmp/harness-bridge-output")
         raw = ic.SerializeToString()
         self.process.stdin.write(struct.pack("<I", len(raw)) + raw)
@@ -49,7 +34,6 @@ class HarnessSession:
         length = struct.unpack("<I", raw_len)[0]
         oc = pb.OutputConfig()
         oc.ParseFromString(self.process.stdout.read(length))
-        self._ws_key = oc.api_key
         
         self.ws = await websockets.connect(
             f"ws://localhost:{oc.port}/",
@@ -57,13 +41,13 @@ class HarnessSession:
         )
         
         hc = pb.HarnessConfig(
-            cascade_id="",  # Must be empty for harness to work
+            cascade_id="",
             gemini_config=pb.GeminiConfig(api_key=self.api_key, model_name=self.model),
             system_instructions=pb.SystemInstructions(
                 appended=pb.AppendedSystemInstructions(
                     appended_sections=[pb.AppendedSystemInstructions.Section(
                         title="user_system_instructions",
-                        content="You are a helpful AI assistant. Reply concisely and accurately.",
+                        content="You are a helpful AI assistant. Reply concisely.",
                     )]
                 )
             ),
@@ -84,14 +68,14 @@ class HarnessSession:
         )
         await self.ws.send(json_format.MessageToJson(pb.InitializeConversationEvent(config=hc)))
         
-        # Drain init responses (harness echoes init confirmation)
+        # Drain init
         try:
             while True:
                 await asyncio.wait_for(self.ws.recv(), timeout=2.0)
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             pass
         
-        # Verify connection alive
+        # Verify alive
         try:
             pong = await self.ws.ping()
             await asyncio.wait_for(pong, timeout=2)
@@ -101,15 +85,16 @@ class HarnessSession:
         print(f"Harness ready ({self.model})", flush=True)
         return self
     
-    async def chat(self, messages: list[dict]) -> dict:
-        """Send messages, return response text."""
+    async def chat(self, messages: list[dict], stream: bool = False):
+        """Send messages to harness. If stream=True, yields (delta_text, is_final, usage)."""
         last_user = ""
         for m in messages:
-            if m["role"] == "user":
-                last_user = m["content"]
+            if m.get("role") == "user":
+                last_user = m.get("content", "")
         
         if not last_user:
-            return {"response": "No user message"}
+            yield "", True, None
+            return
         
         await self.ws.send(json_format.MessageToJson(pb.InputEvent(user_input=str(last_user))))
         
@@ -118,8 +103,8 @@ class HarnessSession:
             while True:
                 msg = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
                 data = json.loads(msg)
-                su = data.get("stepUpdate", {})
-                tsu = data.get("trajectoryStateUpdate", {})
+                su = data.get("stepUpdate")
+                tsu = data.get("trajectoryStateUpdate")
                 usage = data.get("usageMetadata")
                 
                 if su:
@@ -128,28 +113,33 @@ class HarnessSession:
                     
                     # Auto-approve tool calls
                     if state == "STATE_WAITING_FOR_USER":
-                        tool_confirm = pb.InputEvent(
+                        tc = pb.InputEvent(
                             tool_confirmation=pb.ToolConfirmation(
                                 trajectory_id=su.get("trajectoryId", ""),
                                 step_index=su.get("stepIndex", 0),
                                 accepted=True,
                             )
                         )
-                        await self.ws.send(json_format.MessageToJson(tool_confirm))
+                        await self.ws.send(json_format.MessageToJson(tc))
                     
-                    # Only collect assistant response text (from model to user)
+                    # Streaming text from assistant
                     if source == "SOURCE_MODEL":
-                        text_delta = su.get("textDelta", "")
-                        text = su.get("text", "")
-                        # Prefer delta for streaming, fall back to full text
-                        response_text += text_delta or text
+                        delta = su.get("textDelta", "")
+                        full = su.get("text", "")
+                        if delta:
+                            response_text += delta
+                            yield delta, False, None
+                        elif full and not response_text:
+                            response_text = full
+                            yield full, False, None
                 
+                # Trajectory idle = conversation complete
                 if tsu and tsu.get("state") == "STATE_IDLE":
-                    break
+                    yield "", True, usage
+                    return
+                    
         except asyncio.TimeoutError:
-            pass
-        
-        return {"response": response_text or "No response"}
+            yield response_text or "No response", True, None
     
     async def stop(self):
         if self.ws:
@@ -165,7 +155,7 @@ class HarnessSession:
 # ── HTTP Server ─────────────────────────────────────────────
 
 async def handle(reader, writer):
-    """Single HTTP request handler."""
+    """Single HTTP request handler with SSE streaming support."""
     request_data = b""
     while True:
         line = await reader.readline()
@@ -178,23 +168,80 @@ async def handle(reader, writer):
     method = parts[0] if len(parts) > 0 else ""
     path = parts[1] if len(parts) > 1 else ""
     
-    if method == "POST" and path == "/v1/chat/completions":
-        content_length = 0
-        for line in request_data.decode().split("\r\n"):
-            if line.lower().startswith("content-length:"):
-                content_length = int(line.split(":")[1].strip())
+    if method == "GET" and path == "/health":
+        await _respond(writer, 200, {"status": "ok"})
+        return
+    
+    if method != "POST" or path != "/v1/chat/completions":
+        await _respond(writer, 404, {"error": "not found"})
+        return
+    
+    # Read body
+    content_length = 0
+    for line in request_data.decode().split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            content_length = int(line.split(":")[1].strip())
+    
+    body = b""
+    if content_length > 0:
+        body = await reader.readexactly(content_length)
+    
+    try:
+        req = json.loads(body)
+    except:
+        await _respond(writer, 400, {"error": "invalid json"})
+        return
+    
+    stream_mode = req.get("stream", False)
+    
+    if stream_mode:
+        # SSE streaming response
+        resp_id = f"chatcmpl-{os.urandom(8).hex()}"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Cache-Control: no-cache\r\n"
+            b"Connection: keep-alive\r\n"
+            b"Access-Control-Allow-Origin: *\r\n"
+            b"\r\n"
+        )
+        await writer.drain()
         
-        body = b""
-        if content_length > 0:
-            body = await reader.readexactly(content_length)
+        async for delta, is_final, usage in session.chat(req.get("messages", []), stream=True):
+            if delta:
+                chunk = {
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(__import__("time").time()),
+                    "model": "gemini-3.5-flash",
+                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                }
+                writer.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                await writer.drain()
+            
+            if is_final:
+                # Final chunk with finish reason
+                chunk = {
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(__import__("time").time()),
+                    "model": "gemini-3.5-flash",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                writer.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                writer.write(b"data: [DONE]\n\n")
+                await writer.drain()
         
-        try:
-            req = json.loads(body)
-        except:
-            await _respond(writer, 400, {"error": "invalid json"})
-            return
+        writer.close()
+    else:
+        # Non-streaming: accumulate full response
+        full_text = ""
+        async for delta, is_final, usage in session.chat(req.get("messages", [])):
+            if delta:
+                full_text += delta
+            if is_final:
+                break
         
-        result = await session.chat(req.get("messages", []))
         resp = {
             "id": "chatcmpl-harness",
             "object": "chat.completion",
@@ -202,22 +249,18 @@ async def handle(reader, writer):
             "model": "gemini-3.5-flash",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": result["response"]},
+                "message": {"role": "assistant", "content": full_text},
                 "finish_reason": "stop",
             }],
+            "usage": {"total_tokens": 0},
         }
         await _respond(writer, 200, resp)
-    elif method == "GET" and path == "/health":
-        await _respond(writer, 200, {"status": "ok"})
-    else:
-        writer.write(b"HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n")
-        await writer.drain()
-        writer.close()
 
 async def _respond(writer, status, data):
     body = json.dumps(data).encode()
+    status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Error"}
     writer.write(
-        f"HTTP/1.1 {status} {'OK' if status == 200 else 'Error'}\r\n"
+        f"HTTP/1.1 {status} {status_text.get(status, '')}\r\n"
         f"Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"\r\n".encode()
@@ -246,7 +289,7 @@ async def main():
     
     server = await asyncio.start_server(handle, "127.0.0.1", port)
     print(f"🌐 Bridge: http://127.0.0.1:{port}/v1/chat/completions", flush=True)
-    print(f"📝 Test: curl http://127.0.0.1:{port}/health", flush=True)
+    print(f"📝 Supports: streaming (SSE) + non-streaming", flush=True)
     
     async with server:
         await server.serve_forever()
