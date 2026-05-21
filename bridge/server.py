@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
 google-harness-bridge: OpenAI-compatible HTTP → harness WebSocket proxy.
-Supports streaming + tool calling.
+Session-aware: each session gets its own harness instance.
 """
 import asyncio, json, os, struct, subprocess, sys, time
 import websockets
-from google.protobuf import json_format
-import google.antigravity.connections.local.localharness_pb2 as pb
 
-BINARY = os.path.expanduser(
-    "/tmp/agy-env/lib/python3.14/site-packages/google/antigravity/bin/localharness"
-)
+with open("/Users/chen/.openclaw/openclaw.json") as f:
+    _cfg = json.load(f)
+_GEMINI_API_KEY = _cfg.get("env", {}).get("vars", {}).get("GEMINI_API_KEY", "")
+
+from bridge.session_manager import SessionManager
+
+# Initialize global session manager
+session_manager = None
+
+# Active SSE streams (so we don't block on non-chat requests)
+_active_sse = {}  # session_id -> set of writer futures
 
 def _oai_to_harness_tool(tool_def: dict) -> pb.Tool | None:
     """Convert OpenAI tool format to harness Tool proto."""
@@ -209,7 +215,7 @@ class HarnessSession:
                     yield "done", ""
                     return
                     
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
             yield "done", ""
     
     async def stop(self):
@@ -287,79 +293,31 @@ async def handle(reader, writer):
         )
         await writer.drain()
 
-    async for msg_type, msg_data in session.chat(req.get("messages", [])):
-        if msg_type == "text":
-            if msg_data in response_tracker:
-                continue
-            response_tracker.add(msg_data)
-            collected_text += msg_data
-            if stream_mode:
-                chunk = {
-                    "id": resp_id,
-                    "object": "chat.completion.chunk",
-                    "created": now,
-                    "model": "gemini-3.5-flash",
-                    "choices": [{"index": 0, "delta": {"content": msg_data}, "finish_reason": None}],
-                }
-                await _write_sse(writer, json.dumps(chunk))
-        
-        elif msg_type == "tool_call":
-            collected_tool_calls.append(msg_data)
-            if stream_mode:
-                chunk = {
-                    "id": resp_id,
-                    "object": "chat.completion.chunk",
-                    "created": now,
-                    "model": "gemini-3.5-flash",
-                    "choices": [{"index": 0, "delta": {"tool_calls": [msg_data]}, "finish_reason": None}],
-                }
-                await _write_sse(writer, json.dumps(chunk))
-    
-    if stream_mode:
-        finish_reason = "tool_calls" if collected_tool_calls else "stop"
-        chunk = {
-            "id": resp_id, "object": "chat.completion.chunk",
-            "created": now, "model": "gemini-3.5-flash",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-        }
-        await _write_sse(writer, json.dumps(chunk))
-        writer.write(b"data: [DONE]\n\n")
-        await writer.drain()
-        writer.close()
-    else:
-        if collected_tool_calls:
-            resp = {
-                "id": resp_id, "object": "chat.completion",
-                "created": now, "model": "gemini-3.5-flash",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": collected_tool_calls,
-                },
-                    "finish_reason": "tool_calls",
-                }],
-            }
-        else:
-            resp = {
-                "id": resp_id, "object": "chat.completion",
-                "created": now, "model": "gemini-3.5-flash",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": collected_text},
-                    "finish_reason": "stop",
-                }],
-            }
-        await _respond(writer, 200, resp)
+    # Session-aware: each session_id gets its own harness
+    session_key = req.get("session_id", req.get("user", "default"))
+    harness = await session_manager.get_or_create(session_key)
+    collected_text = ""
 
-async def _write_sse(writer, data: str):
-    """Write SSE data chunk."""
-    try:
-        writer.write(f"data: {data}\n\n".encode())
-        await writer.drain()
-    except:
-        pass
+    # Extract last user message and send to session's harness
+    for m in req.get("messages", []):
+        if m.get("role") == "user":
+            last_msg = m.get("content", "")
+            if last_msg:
+                collected_text = await harness.queue_message(last_msg, timeout=60.0)
+
+    # Build and send response
+    if collected_text:
+        resp = {
+            "id": resp_id,
+            "object": "chat.completion",
+            "created": now,
+            "model": "gemini-3.5-flash",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": collected_text}, "finish_reason": "stop"}],
+        }
+        await _respond(writer, 200, resp)
+    else:
+        await _respond(writer, 200, {"choices": [{"message": {"content": "No response"}}]})
+
 
 async def _respond(writer, status, data):
     body = json.dumps(data).encode()
@@ -376,50 +334,29 @@ async def _respond(writer, status, data):
 
 
 async def main():
-    global session
-    
-    api_key = os.environ.get("GEMINI_API_KEY") or ""
-    if not api_key:
-        with open("/Users/chen/.openclaw/openclaw.json") as f:
-            cfg = json.load(f)
-        api_key = cfg.get("env", {}).get("vars", {}).get("GEMINI_API_KEY", "")
-    if not api_key:
-        print("ERROR: No GEMINI_API_KEY", flush=True)
-        sys.exit(1)
+    global session_manager
     
     port = int(os.environ.get("HARNESS_PORT", "8080"))
     
-    print("🚀 Starting Google Harness Bridge...", flush=True)
-    # Detect available skills
-    skills_base = os.path.expanduser("~/.openclaw/skills")
-    skill_dirs = []
-    if os.path.isdir(skills_base):
-        skill_dirs = [
-            os.path.join(skills_base, d)
-            for d in sorted(os.listdir(skills_base))
-            if os.path.isdir(os.path.join(skills_base, d)) and not d.startswith(".")
-        ]
-    print(f"📚 Loaded {len(skill_dirs)} skills", flush=True)
-    
-    session = await HarnessSession(api_key=api_key, skill_dirs=skill_dirs).start(tool_defs=[])
+    print("🚀 Starting Google Harness Bridge (session-aware)...", flush=True)
+    session_manager = await SessionManager(api_key=_GEMINI_API_KEY).start()
     
     server = await asyncio.start_server(handle, "127.0.0.1", port)
     print(f"🌐 http://127.0.0.1:{port}/v1/chat/completions", flush=True)
-    print(f"📝 streaming + tool calling", flush=True)
+    print(f"📝 session-aware | per-session harness instances", flush=True)
     
     async with server:
         await server.serve_forever()
 
 
 if __name__ == "__main__":
-    session = None
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\nShutting down...", flush=True)
-        if session:
+        if session_manager:
             try:
-                loop.run_until_complete(session.stop())
+                loop.run_until_complete(session_manager.stop_all())
             except:
                 pass
