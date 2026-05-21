@@ -42,8 +42,16 @@ async def handle(reader, writer):
         await _respond(writer, 404, {"error": "not found"})
         return
     
+    # Parse all HTTP headers
+    headers = {}
     content_length = 0
     for line in request_data.decode().split("\r\n"):
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key_s = key.strip().lower()
+            val_s = val.strip()
+            if key_s:
+                headers[key_s] = headers.get(key_s, val_s) if key_s not in headers else headers[key_s]  # keep first
         if line.lower().startswith("content-length:"):
             content_length = int(line.split(":")[1].strip())
     
@@ -82,8 +90,8 @@ async def handle(reader, writer):
         await writer.drain()
 
     
-    # Session-aware: each session_id gets its own harness
-    session_key = req.get("session_id", req.get("user", "default"))
+    # Session-aware: derive key from X-Session-Id header (injected by OpenClaw), then user field, then env var
+    session_key = headers.get("x-session-id", req.get("session_id", req.get("user", os.environ.get("SESSION_NAME", "default"))))
     harness = await session_manager.get_or_create(session_key)
     collected_text = ""
 
