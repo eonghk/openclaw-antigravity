@@ -89,7 +89,7 @@ class HarnessSession:
                 list_dir=pb.ListDirToolConfig(enabled=True),
                 generate_image=pb.GenerateImageToolConfig(enabled=True, model_name="gemini-3.1-flash-image-preview"),
             ),
-            workspaces=[pb.Workspace(filesystem_workspace=pb.FilesystemWorkspace(directory="/tmp"))],
+            workspaces=[],
         )
         await self.ws.send(json_format.MessageToJson(pb.InitializeConversationEvent(config=hc)))
         
@@ -168,7 +168,7 @@ class HarnessSession:
                             tool_confirmation=pb.ToolConfirmation(
                                 trajectory_id=su.get("trajectoryId", ""),
                                 step_index=su.get("stepIndex", 0),
-                                accepted=False,
+                                accepted=True,
                             )
                         )
                         await self.ws.send(json_format.MessageToJson(tc_skip))
