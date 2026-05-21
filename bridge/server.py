@@ -66,7 +66,8 @@ async def handle(reader, writer):
         return
     
     import sys as _sys
-    print(f"[bridge] REQ: model={req.get('model','?')} stream={req.get('stream',False)} msgs={len(req.get('messages',[]))}", flush=True)
+    _sys.stderr.write(f"[bridge] REQ: model={req.get('model','?')} stream={req.get('stream',False)} msgs={len(req.get('messages',[]))} raw_keys={list(req.keys())} headers_x_session={headers.get('x-session-id','NOT_SET')}\n")
+    _sys.stderr.flush()
     
     stream_mode = req.get("stream", False)
     resp_id = f"chatcmpl-{os.urandom(8).hex()}"
@@ -90,8 +91,9 @@ async def handle(reader, writer):
         await writer.drain()
 
     
-    # Session-aware: derive key from X-Session-Id header (injected by OpenClaw), then user field, then env var
-    session_key = headers.get("x-session-id", req.get("session_id", req.get("user", os.environ.get("SESSION_NAME", "default"))))
+    # Session-aware: each agent configures its own model name → used as session key
+    model_name = req.get("model", os.environ.get("SESSION_NAME", "default"))
+    session_key = f"agent:{model_name}" 
     harness = await session_manager.get_or_create(session_key)
     collected_text = ""
 
