@@ -1,0 +1,10 @@
+[project]
+name = "google-harness-bridge"
+version = "0.1.0"
+description = "OpenAI-compatible HTTP bridge for Google's native agent runtime"
+requires-python = ">=3.10"
+dependencies = [
+    "google-antigravity",
+    "websockets",
+    "protobuf",
+]
