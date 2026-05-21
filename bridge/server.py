@@ -227,6 +227,7 @@ class HarnessSession:
 
 async def handle(reader, writer):
     """Single HTTP request handler."""
+    """Single HTTP request handler."""
     request_data = b""
     while True:
         line = await reader.readline()
@@ -243,7 +244,7 @@ async def handle(reader, writer):
         await _respond(writer, 200, {"status": "ok"})
         return
     
-    if method != "POST" or path != "/v1/chat/completions":
+    if method != "POST" or (path != "/v1/chat/completions" and path != "/chat/completions"):
         await _respond(writer, 404, {"error": "not found"})
         return
     
@@ -261,6 +262,9 @@ async def handle(reader, writer):
     except:
         await _respond(writer, 400, {"error": "invalid json"})
         return
+    
+    import sys as _sys
+    print(f"[bridge] REQ: model={req.get('model','?')} stream={req.get('stream',False)} msgs={len(req.get('messages',[]))}", flush=True)
     
     stream_mode = req.get("stream", False)
     resp_id = f"chatcmpl-{os.urandom(8).hex()}"

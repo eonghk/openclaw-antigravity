@@ -1,5 +1,5 @@
 // Google Harness OpenClaw plugin entry point
-// Registers the google-harness provider and runtime
+// Registers the google-antigravity provider and runtime
 
 import providerCatalog from "./provider.mjs";
 
@@ -18,12 +18,12 @@ export function onDeactivate() {
 }
 
 // Tell OpenClaw which harness types this plugin handles
-export const harnessRuntime = "google-harness";
+export const harnessRuntime = "google-antigravity";
 
-// When OpenClaw routes a request through google-harness,
+// When OpenClaw routes a request through google-antigravity,
 // it hits the bridge HTTP API
 export function createRuntimeConfig(provider, model, config) {
-  const bridgePort = config?.plugins?.entries?.["google-harness"]?.port ?? 8080;
+  const bridgePort = config?.plugins?.entries?.["google-antigravity"]?.port ?? 8080;
   return {
     baseUrl: `http://127.0.0.1:${bridgePort}`,
     models: [model],

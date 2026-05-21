@@ -1,8 +1,8 @@
 // Google Harness provider registration
-// Registers google-harness as a custom provider backed by the Python bridge
+// Registers google-antigravity as a custom provider backed by the Python bridge
 
 export default {
-  id: "google-harness",
+  id: "google-antigravity",
   name: "Google Harness",
   description: "Gemini models via Antigravity localharness runtime",
   
@@ -22,7 +22,7 @@ export default {
     credentials: ["GEMINI_API_KEY"],
   },
   
-  // Onboard config (for `openclaw onboard --google-harness`)
+  // Onboard config (for `openclaw onboard --google-antigravity`)
   onboard: {
     authChoice: "gemini-api-key",
     defaultModel: "gemini-3.5-flash",
