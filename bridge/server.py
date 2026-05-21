@@ -25,9 +25,10 @@ def _oai_to_harness_tool(tool_def: dict) -> pb.Tool | None:
     )
 
 class HarnessSession:
-    def __init__(self, api_key: str, model: str = "gemini-3.5-flash"):
+    def __init__(self, api_key: str, model: str = "gemini-3.5-flash", skill_dirs: list[str] = None):
         self.api_key = api_key
         self.model = model
+        self.skill_dirs = skill_dirs or []
         self.process = None
         self.ws = None
         self._pending_tool_calls = {}  # tool_call_id -> proto ToolCall response
@@ -90,6 +91,7 @@ class HarnessSession:
                 generate_image=pb.GenerateImageToolConfig(enabled=True, model_name="gemini-3.1-flash-image-preview"),
             ),
             workspaces=[],
+            skills_paths=self.skill_dirs,
         )
         await self.ws.send(json_format.MessageToJson(pb.InitializeConversationEvent(config=hc)))
         
@@ -384,7 +386,18 @@ async def main():
     port = int(os.environ.get("HARNESS_PORT", "8080"))
     
     print("🚀 Starting Google Harness Bridge...", flush=True)
-    session = await HarnessSession(api_key=api_key).start(tool_defs=[])
+    # Detect available skills
+    skills_base = os.path.expanduser("~/.openclaw/skills")
+    skill_dirs = []
+    if os.path.isdir(skills_base):
+        skill_dirs = [
+            os.path.join(skills_base, d)
+            for d in sorted(os.listdir(skills_base))
+            if os.path.isdir(os.path.join(skills_base, d)) and not d.startswith(".")
+        ]
+    print(f"📚 Loaded {len(skill_dirs)} skills", flush=True)
+    
+    session = await HarnessSession(api_key=api_key, skill_dirs=skill_dirs).start(tool_defs=[])
     
     server = await asyncio.start_server(handle, "127.0.0.1", port)
     print(f"🌐 http://127.0.0.1:{port}/v1/chat/completions", flush=True)
