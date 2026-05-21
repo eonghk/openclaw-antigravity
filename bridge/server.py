@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 google-harness-bridge: OpenAI-compatible HTTP → harness WebSocket proxy.
-Supports both streaming (SSE) and non-streaming responses.
+Supports streaming + tool calling.
 """
-import asyncio, json, os, struct, subprocess, sys
+import asyncio, json, os, struct, subprocess, sys, time
 import websockets
 from google.protobuf import json_format
 import google.antigravity.connections.local.localharness_pb2 as pb
@@ -12,16 +12,28 @@ BINARY = os.path.expanduser(
     "/tmp/agy-env/lib/python3.14/site-packages/google/antigravity/bin/localharness"
 )
 
+def _oai_to_harness_tool(tool_def: dict) -> pb.Tool | None:
+    """Convert OpenAI tool format to harness Tool proto."""
+    if tool_def.get("type") != "function":
+        return None
+    fn = tool_def.get("function", {})
+    return pb.Tool(
+        name=fn.get("name", ""),
+        description=fn.get("description", ""),
+        parameters_json_schema=json.dumps(fn.get("parameters", {})),
+        response_json_schema="",
+    )
+
 class HarnessSession:
-    """Manages localharness process + WebSocket."""
-    
     def __init__(self, api_key: str, model: str = "gemini-3.5-flash"):
         self.api_key = api_key
         self.model = model
         self.process = None
         self.ws = None
+        self._pending_tool_calls = {}  # tool_call_id -> proto ToolCall response
     
-    async def start(self):
+    async def start(self, tool_defs: list[dict] = None):
+        """Launch harness with optional tool definitions."""
         self.process = subprocess.Popen(
             [BINARY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
@@ -40,6 +52,14 @@ class HarnessSession:
             additional_headers={"x-goog-api-key": oc.api_key},
         )
         
+        # Convert OpenAI tools to harness tools
+        harness_tools = []
+        if tool_defs:
+            for td in tool_defs:
+                t = _oai_to_harness_tool(td)
+                if t:
+                    harness_tools.append(t)
+        
         hc = pb.HarnessConfig(
             cascade_id="",
             gemini_config=pb.GeminiConfig(api_key=self.api_key, model_name=self.model),
@@ -47,11 +67,16 @@ class HarnessSession:
                 appended=pb.AppendedSystemInstructions(
                     appended_sections=[pb.AppendedSystemInstructions.Section(
                         title="user_system_instructions",
-                        content="You are a helpful AI assistant. Reply concisely.",
+                        content=(
+                            "You are a helpful AI assistant powered by Gemini 3.5 Flash.\n"
+                            "Reply concisely and accurately.\n"
+                            "When you need to use a tool, call it with the correct arguments.\n"
+                            "After receiving tool results, incorporate them into your response."
+                        ),
                     )]
                 )
             ),
-            tools=[],
+            tools=harness_tools,
             harness_side_tools=pb.HarnessSideTools(
                 subagents=pb.SubagentsConfig(enabled=True),
                 find=pb.FindToolConfig(enabled=True),
@@ -75,71 +100,115 @@ class HarnessSession:
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             pass
         
-        # Verify alive
         try:
             pong = await self.ws.ping()
             await asyncio.wait_for(pong, timeout=2)
         except:
             raise RuntimeError("Harness died after init")
         
-        print(f"Harness ready ({self.model})", flush=True)
+        tool_count = len(harness_tools)
+        print(f"Harness ready ({self.model}) with {tool_count} tools", flush=True)
         return self
     
-    async def chat(self, messages: list[dict], stream: bool = False):
-        """Send messages to harness. If stream=True, yields (delta_text, is_final, usage)."""
-        last_user = ""
+    async def chat(self, messages: list[dict]):
+        """
+        Handle one round of chat. May return text or tool calls.
+        Yields: (type, data) where type is "text", "tool_call", or "done"
+        """
+        # Find last user message OR tool result to send
+        last_tool_result = None
+        last_user = None
+        
         for m in messages:
             if m.get("role") == "user":
                 last_user = m.get("content", "")
+            elif m.get("role") == "tool":
+                last_tool_result = {
+                    "tool_call_id": m.get("tool_call_id", ""),
+                    "content": m.get("content", ""),
+                }
         
-        if not last_user:
-            yield "", True, None
+        # If there's a pending tool result to send, use tool_response
+        if last_tool_result:
+            tc_id = last_tool_result["tool_call_id"]
+            tc_response = self._pending_tool_calls.get(tc_id, {})
+            if tc_response:
+                tool_resp = pb.InputEvent(
+                    tool_response=pb.ToolResponse(
+                        id=tc_response.get("harness_tool_call_id", tc_id),
+                        response_json=last_tool_result["content"],
+                    )
+                )
+                await self.ws.send(json_format.MessageToJson(tool_resp))
+                del self._pending_tool_calls[tc_id]
+        elif last_user:
+            await self.ws.send(json_format.MessageToJson(pb.InputEvent(user_input=str(last_user))))
+        else:
+            yield "done", ""
             return
         
-        await self.ws.send(json_format.MessageToJson(pb.InputEvent(user_input=str(last_user))))
-        
-        response_text = ""
+        # Stream responses
         try:
             while True:
                 msg = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
                 data = json.loads(msg)
                 su = data.get("stepUpdate")
                 tsu = data.get("trajectoryStateUpdate")
+                tc_out = data.get("toolCall")
                 usage = data.get("usageMetadata")
                 
                 if su:
                     state = su.get("state", "")
                     source = su.get("source", "")
                     
-                    # Auto-approve tool calls
+                    # Harness native tool approval (auto-approve off, skip instead)
                     if state == "STATE_WAITING_FOR_USER":
-                        tc = pb.InputEvent(
+                        # Skip built-in tool requests
+                        tc_skip = pb.InputEvent(
                             tool_confirmation=pb.ToolConfirmation(
                                 trajectory_id=su.get("trajectoryId", ""),
                                 step_index=su.get("stepIndex", 0),
-                                accepted=True,
+                                accepted=False,
                             )
                         )
-                        await self.ws.send(json_format.MessageToJson(tc))
+                        await self.ws.send(json_format.MessageToJson(tc_skip))
                     
-                    # Streaming text from assistant
+                    # Forward assistant text
                     if source == "SOURCE_MODEL":
-                        delta = su.get("textDelta", "")
-                        full = su.get("text", "")
-                        if delta:
-                            response_text += delta
-                            yield delta, False, None
-                        elif full and not response_text:
-                            response_text = full
-                            yield full, False, None
+                        text = su.get("text", "")
+                        text_delta = su.get("textDelta", "")
+                        # state check for tool calls
+                        if state == "STATE_WAITING_FOR_USER":
+                            pass  # already handled above
+                        elif text_delta:
+                            yield "text", text_delta
+                        elif text and not text_delta:
+                            yield "text", text
                 
-                # Trajectory idle = conversation complete
+                # Custom tool call from harness
+                if tc_out:
+                    tc_id = tc_out.get("id", "")
+                    self._pending_tool_calls[tc_id] = {
+                        "harness_tool_call_id": tc_id,
+                        "name": tc_out.get("name", ""),
+                        "arguments": tc_out.get("argumentsJson", "{}"),
+                }
+                    yield "tool_call", {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc_out.get("name", ""),
+                            "arguments": tc_out.get("argumentsJson", "{}"),
+                    }
+                }
+                
+                # Trajectory idle = conversation turn complete
                 if tsu and tsu.get("state") == "STATE_IDLE":
-                    yield "", True, usage
+                    yield "done", ""
                     return
                     
         except asyncio.TimeoutError:
-            yield response_text or "No response", True, None
+            yield "done", ""
     
     async def stop(self):
         if self.ws:
@@ -155,7 +224,7 @@ class HarnessSession:
 # ── HTTP Server ─────────────────────────────────────────────
 
 async def handle(reader, writer):
-    """Single HTTP request handler with SSE streaming support."""
+    """Single HTTP request handler."""
     request_data = b""
     while True:
         line = await reader.readline()
@@ -176,7 +245,6 @@ async def handle(reader, writer):
         await _respond(writer, 404, {"error": "not found"})
         return
     
-    # Read body
     content_length = 0
     for line in request_data.decode().split("\r\n"):
         if line.lower().startswith("content-length:"):
@@ -193,10 +261,16 @@ async def handle(reader, writer):
         return
     
     stream_mode = req.get("stream", False)
+    resp_id = f"chatcmpl-{os.urandom(8).hex()}"
+    now = int(time.time())
     
+    # Collect response
+    collected_text = ""
+    collected_tool_calls = []
+    response_tracker = set()
+
     if stream_mode:
-        # SSE streaming response
-        resp_id = f"chatcmpl-{os.urandom(8).hex()}"
+        # Write SSE HTTP headers before streaming
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/event-stream\r\n"
@@ -206,59 +280,84 @@ async def handle(reader, writer):
             b"\r\n"
         )
         await writer.drain()
-        
-        async for delta, is_final, usage in session.chat(req.get("messages", []), stream=True):
-            if delta:
+
+    async for msg_type, msg_data in session.chat(req.get("messages", [])):
+        if msg_type == "text":
+            if msg_data in response_tracker:
+                continue
+            response_tracker.add(msg_data)
+            collected_text += msg_data
+            if stream_mode:
                 chunk = {
                     "id": resp_id,
                     "object": "chat.completion.chunk",
-                    "created": int(__import__("time").time()),
+                    "created": now,
                     "model": "gemini-3.5-flash",
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"content": msg_data}, "finish_reason": None}],
                 }
-                writer.write(f"data: {json.dumps(chunk)}\n\n".encode())
-                await writer.drain()
-            
-            if is_final:
-                # Final chunk with finish reason
+                await _write_sse(writer, json.dumps(chunk))
+        
+        elif msg_type == "tool_call":
+            collected_tool_calls.append(msg_data)
+            if stream_mode:
                 chunk = {
                     "id": resp_id,
                     "object": "chat.completion.chunk",
-                    "created": int(__import__("time").time()),
+                    "created": now,
                     "model": "gemini-3.5-flash",
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "choices": [{"index": 0, "delta": {"tool_calls": [msg_data]}, "finish_reason": None}],
                 }
-                writer.write(f"data: {json.dumps(chunk)}\n\n".encode())
-                writer.write(b"data: [DONE]\n\n")
-                await writer.drain()
-        
+                await _write_sse(writer, json.dumps(chunk))
+    
+    if stream_mode:
+        finish_reason = "tool_calls" if collected_tool_calls else "stop"
+        chunk = {
+            "id": resp_id, "object": "chat.completion.chunk",
+            "created": now, "model": "gemini-3.5-flash",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        }
+        await _write_sse(writer, json.dumps(chunk))
+        writer.write(b"data: [DONE]\n\n")
+        await writer.drain()
         writer.close()
     else:
-        # Non-streaming: accumulate full response
-        full_text = ""
-        async for delta, is_final, usage in session.chat(req.get("messages", [])):
-            if delta:
-                full_text += delta
-            if is_final:
-                break
-        
-        resp = {
-            "id": "chatcmpl-harness",
-            "object": "chat.completion",
-            "created": int(__import__("time").time()),
-            "model": "gemini-3.5-flash",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": full_text},
-                "finish_reason": "stop",
-            }],
-            "usage": {"total_tokens": 0},
-        }
+        if collected_tool_calls:
+            resp = {
+                "id": resp_id, "object": "chat.completion",
+                "created": now, "model": "gemini-3.5-flash",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": collected_tool_calls,
+                },
+                    "finish_reason": "tool_calls",
+                }],
+            }
+        else:
+            resp = {
+                "id": resp_id, "object": "chat.completion",
+                "created": now, "model": "gemini-3.5-flash",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": collected_text},
+                    "finish_reason": "stop",
+                }],
+            }
         await _respond(writer, 200, resp)
+
+async def _write_sse(writer, data: str):
+    """Write SSE data chunk."""
+    try:
+        writer.write(f"data: {data}\n\n".encode())
+        await writer.drain()
+    except:
+        pass
 
 async def _respond(writer, status, data):
     body = json.dumps(data).encode()
-    status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Error"}
+    status_text = {200: "OK", 400: "Bad Request", 404: "Not Found"}
     writer.write(
         f"HTTP/1.1 {status} {status_text.get(status, '')}\r\n"
         f"Content-Type: application/json\r\n"
@@ -285,11 +384,11 @@ async def main():
     port = int(os.environ.get("HARNESS_PORT", "8080"))
     
     print("🚀 Starting Google Harness Bridge...", flush=True)
-    session = await HarnessSession(api_key=api_key).start()
+    session = await HarnessSession(api_key=api_key).start(tool_defs=[])
     
     server = await asyncio.start_server(handle, "127.0.0.1", port)
-    print(f"🌐 Bridge: http://127.0.0.1:{port}/v1/chat/completions", flush=True)
-    print(f"📝 Supports: streaming (SSE) + non-streaming", flush=True)
+    print(f"🌐 http://127.0.0.1:{port}/v1/chat/completions", flush=True)
+    print(f"📝 streaming + tool calling", flush=True)
     
     async with server:
         await server.serve_forever()
