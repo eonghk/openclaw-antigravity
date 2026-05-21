@@ -123,8 +123,8 @@ class HarnessSession:
                 usage = data.get("usageMetadata")
                 
                 if su:
-                    text = su.get("text", "") or su.get("textDelta", "")
                     state = su.get("state", "")
+                    source = su.get("source", "")
                     
                     # Auto-approve tool calls
                     if state == "STATE_WAITING_FOR_USER":
@@ -137,8 +137,12 @@ class HarnessSession:
                         )
                         await self.ws.send(json_format.MessageToJson(tool_confirm))
                     
-                    if text:
-                        response_text += text
+                    # Only collect assistant response text (from model to user)
+                    if source == "SOURCE_MODEL":
+                        text_delta = su.get("textDelta", "")
+                        text = su.get("text", "")
+                        # Prefer delta for streaming, fall back to full text
+                        response_text += text_delta or text
                 
                 if tsu and tsu.get("state") == "STATE_IDLE":
                     break
