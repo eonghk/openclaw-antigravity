@@ -1,0 +1,30 @@
+{
+  "id": "google-harness",
+  "name": "Google Harness",
+  "description": "Google native agent runtime via Antigravity localharness — optimized prompt, native tool execution, Gemini 3.5 Flash support.",
+  "providers": ["google-harness"],
+  "contracts": {},
+  "providerCatalogEntry": "./dist/provider.mjs",
+  "activation": {
+    "onStartup": false,
+    "onAgentHarnesses": ["google-harness"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "model": {
+        "type": "string",
+        "default": "gemini-3.5-flash"
+      },
+      "port": {
+        "type": "integer",
+        "default": 8080
+      },
+      "harnessBinary": {
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

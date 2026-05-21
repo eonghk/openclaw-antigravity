@@ -1,7 +1,7 @@
 [project]
-name = "google-harness-bridge"
+name = "google-harness-bridge-server"
 version = "0.1.0"
-description = "OpenAI-compatible HTTP bridge for Google's native agent runtime"
+description = "HTTP bridge for Google's native agent runtime (localharness)"
 requires-python = ">=3.10"
 dependencies = [
     "google-antigravity",

@@ -1,0 +1,16 @@
+{
+  "name": "@chen/google-harness-bridge",
+  "version": "0.1.0",
+  "description": "OpenClaw Google Harness provider plugin — Gemini native agent runtime via Antigravity localharness",
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.0.0"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.mjs"],
+    "install": {
+      "npmSpec": "@chen/google-harness-bridge",
+      "defaultChoice": "npm"
+    }
+  }
+}
