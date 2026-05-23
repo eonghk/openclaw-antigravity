@@ -34,18 +34,18 @@ The npm package owns the OpenClaw provider and CLI. The Python bridge remains a 
 ## Install
 
 ```bash
-npm install -g git+ssh://git@github-personal/eonghk/openclaw-antigravity.git
+npm install -g openclaw-antigravity
 openclaw-antigravity install
 openclaw-antigravity doctor
 ```
 
-The package is not published to npm yet. After npm publication, the install command will become:
+Set `GEMINI_API_KEY` in your environment or in `~/.openclaw/openclaw.json` under `env.vars.GEMINI_API_KEY`.
+
+Development installs can use the GitHub repo directly:
 
 ```bash
-npm install -g openclaw-antigravity
+npm install -g git+ssh://git@github.com/eonghk/openclaw-antigravity.git
 ```
-
-Set `GEMINI_API_KEY` in your environment or in `~/.openclaw/openclaw.json` under `env.vars.GEMINI_API_KEY`.
 
 ## Run
 
@@ -68,13 +68,15 @@ Logs:
 ~/.openclaw-antigravity/logs/bridge.err.log
 ```
 
-Manage the service:
+`openclaw-antigravity install` is the macOS service installer. It installs or updates the Python sidecar environment, writes the LaunchAgent plist, and starts the bridge. Manage the service with:
 
 ```bash
 openclaw-antigravity status
 openclaw-antigravity logs
 openclaw-antigravity uninstall
 ```
+
+`uninstall` stops the LaunchAgent and removes the plist. It leaves `~/.openclaw-antigravity/venv` and logs in place so diagnostics and dependency caches are not destroyed unexpectedly.
 
 Foreground mode:
 
@@ -132,7 +134,7 @@ The provider uses OpenAI-compatible completions against the local bridge. OpenCl
 ## Development
 
 ```bash
-git clone git@github-personal:eonghk/openclaw-antigravity.git
+git clone git@github.com:eonghk/openclaw-antigravity.git
 cd openclaw-antigravity
 npm test
 ```
