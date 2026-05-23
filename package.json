@@ -8,7 +8,9 @@
   },
   "files": [
     "bin/",
-    "bridge/",
+    "bridge/*.py",
+    "bridge/*.sh",
+    "bridge/pyproject.toml",
     "dist/",
     "openclaw.plugin.json",
     "README.md"
