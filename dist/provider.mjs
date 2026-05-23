@@ -1,5 +1,5 @@
 export const PROVIDER_ID = "google-antigravity";
-export const PROVIDER_LABEL = "Google Harness";
+export const PROVIDER_LABEL = "Google Antigravity";
 export const DEFAULT_MODEL = "gemini-3.5-flash";
 export const DEFAULT_PORT = 8080;
 export const LOCAL_API_KEY = "custom-local";

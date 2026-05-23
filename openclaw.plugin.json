@@ -1,7 +1,7 @@
 {
   "id": "google-antigravity",
-  "name": "Google Harness",
-  "description": "Google native agent runtime via Antigravity localharness — optimized prompt, native tool execution, Gemini 3.5 Flash support.",
+  "name": "Google Antigravity",
+  "description": "OpenClaw provider for Google Antigravity localharness. Requires the official google-antigravity Python package.",
   "providers": ["google-antigravity"],
   "contracts": {},
   "providerCatalogEntry": "./dist/provider.mjs",

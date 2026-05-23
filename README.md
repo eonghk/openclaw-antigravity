@@ -1,71 +1,114 @@
-# Google Harness Bridge — OpenClaw Plugin
+# OpenClaw Antigravity
 
-OpenClaw provider plugin for Google's native agent runtime via Antigravity localharness.
-Enables Gemini models with optimized system prompt, native tool execution, and agent loop.
+OpenClaw provider plugin for Google Antigravity localharness.
+
+This project packages one OpenClaw plugin plus a Python sidecar bridge. The bridge depends on Google's official `google-antigravity` Python package and does not redistribute the `localharness` binary.
+
+## Status
+
+Experimental, macOS-first, and intended for local OpenClaw installations.
+
+What works today:
+
+- OpenAI-compatible `/v1/chat/completions` endpoint
+- non-streaming and SSE responses
+- per-session harness isolation
+- FIFO processing inside one session
+- cross-session concurrency
+- OpenAI tool-call bridge
+- deterministic fake adapter regression tests
+- OpenClaw provider plugin entry point
 
 ## Architecture
 
 ```
-OpenClaw
-  └── google-harness provider ── HTTP/JSON ──► bridge/server.py ── WebSocket ──► localharness ──► Gemini API
-                                                (Python)                      (100MB binary)
+OpenClaw provider plugin
+  -> http://127.0.0.1:8080/v1/chat/completions
+  -> Python bridge sidecar
+  -> google-antigravity localharness
+  -> Gemini / Antigravity runtime
 ```
 
-## Structure
+The npm package owns the OpenClaw provider and CLI. The Python bridge remains a separate process so Python dependencies, localharness lifecycle, crash recovery, and logs stay isolated from the OpenClaw Node.js process.
 
-```
-├── openclaw.plugin.json      # OpenClaw plugin manifest
-├── package.json              # npm package
-├── dist/
-│   ├── index.mjs             # Plugin entry point
-│   └── provider.mjs          # Provider catalog registration
-└── bridge/
-    ├── server.py             # Python HTTP + WebSocket bridge
-    ├── start.sh              # Bridge startup script
-    └── pyproject.toml        # Python dependencies
-```
-
-## Quick Start
+## Install
 
 ```bash
-# 1. Start the bridge
-cd /tmp/google-harness-bridge
-HARNESS_ADAPTER=fake HARNESS_PORT=18080 PYTHONPATH=/tmp/google-harness-bridge python3 -u bridge/server.py
-
-# 2. Run the OpenClaw-compatible test client
-BRIDGE_URL=http://127.0.0.1:18080 python3 bridge/test-bridge.py
-
-# 3. For real Antigravity/localharness smoke tests
-PYTHONPATH=/tmp/google-harness-bridge:/tmp/agy-env/lib/python3.14/site-packages \
-  HARNESS_ADAPTER=real HARNESS_PORT=8080 \
-  /opt/homebrew/bin/python3 -u bridge/server.py
-
-# 4. Configure OpenClaw
-# openclaw.json:
-# {
-#   "models": {
-#     "providers": {
-#       "google-harness": { "baseUrl": "http://127.0.0.1:8080" }
-#     }
-#   }
-# }
-
-# 5. Use the model
-# openclaw models set google-harness/gemini-3.5-flash
+npm install -g openclaw-antigravity
+python3 -m venv ~/.openclaw-antigravity
+~/.openclaw-antigravity/bin/pip install google-antigravity
+PYTHON=~/.openclaw-antigravity/bin/python openclaw-antigravity doctor
 ```
 
-## Status
+Set `GEMINI_API_KEY` in your environment or in `~/.openclaw/openclaw.json` under `env.vars.GEMINI_API_KEY`.
 
-Bridge refactor in progress. The Python bridge now has:
+## Run
 
-- OpenAI-compatible non-streaming and SSE responses
-- per-session harness isolation
-- FIFO queueing within a session
-- cross-session concurrency
-- deterministic fake adapter for regression tests
-- real localharness adapter smoke-tested outside OpenClaw
+```bash
+PYTHON=~/.openclaw-antigravity/bin/python openclaw-antigravity start
+```
 
-Next: finish non-invasive OpenClaw provider/plugin wiring and tighten tool permissions.
+Default bridge URL:
+
+```
+http://127.0.0.1:8080/v1/chat/completions
+```
+
+Useful environment variables:
+
+- `HARNESS_PORT`: bridge port, default `8080`
+- `HARNESS_ADAPTER`: `real` or `fake`, default `real`
+- `HARNESS_BINARY`: optional explicit path to `localharness`
+- `HARNESS_SESSION_IDLE_SEC`: session idle timeout
+- `HARNESS_MAX_ACTIVE_SESSIONS`: active session cap
+- `HARNESS_REQUEST_TIMEOUT_SEC`: request timeout
+
+## Test
+
+```bash
+openclaw-antigravity test
+```
+
+The test command uses the fake adapter and does not require `google-antigravity` or a Gemini API key.
+
+## OpenClaw Provider
+
+The plugin registers provider id:
+
+```
+google-antigravity
+```
+
+Models:
+
+- `gemini-3.5-flash`
+- `gemini-3.1-pro`
+- `gemini-3.1-flash`
+
+The provider uses OpenAI-compatible completions against the local bridge. OpenClaw session metadata is forwarded as headers so the bridge can isolate sessions.
+
+## Security
+
+- The bridge binds to `127.0.0.1` only.
+- Missing session ids are rejected for chat requests.
+- This package does not include Google's `localharness` binary.
+- Do not publish local `.env`, OpenClaw config, service account JSON, or API keys.
+- Run a secret scan before publishing releases.
+
+## Development
+
+```bash
+git clone git@github-personal:eonghk/openclaw-antigravity.git
+cd openclaw-antigravity
+npm test
+```
+
+Run the bridge directly:
+
+```bash
+HARNESS_ADAPTER=fake HARNESS_PORT=18080 PYTHONPATH=$PWD python3 -u bridge/server.py
+BRIDGE_URL=http://127.0.0.1:18080 python3 bridge/test-bridge.py
+```
 
 ## License
 

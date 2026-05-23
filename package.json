@@ -1,16 +1,31 @@
 {
-  "name": "@chen/google-harness-bridge",
+  "name": "openclaw-antigravity",
   "version": "0.1.0",
-  "description": "OpenClaw Google Harness provider plugin — Gemini native agent runtime via Antigravity localharness",
+  "description": "OpenClaw provider plugin for Google Antigravity localharness",
   "type": "module",
+  "bin": {
+    "openclaw-antigravity": "./bin/openclaw-antigravity.mjs"
+  },
+  "files": [
+    "bin/",
+    "bridge/",
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "doctor": "node ./bin/openclaw-antigravity.mjs doctor",
+    "test": "node ./bin/openclaw-antigravity.mjs test"
+  },
   "dependencies": {
     "ws": "^8.0.0"
   },
   "openclaw": {
     "extensions": ["./dist/index.mjs"],
     "install": {
-      "npmSpec": "@chen/google-harness-bridge",
+      "npmSpec": "openclaw-antigravity",
       "defaultChoice": "npm"
     }
-  }
+  },
+  "license": "MIT"
 }

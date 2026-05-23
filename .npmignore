@@ -2,13 +2,12 @@ __pycache__/
 *.pyc
 .env
 .env.*
-!.env.example
-venv/
-.venv/
+.git/
+.github/
 node_modules/
-dist/*.js.map
 *.log
 *.pem
 *.key
 *service-account*.json
 *credentials*.json
+openclaw-antigravity-*.tgz

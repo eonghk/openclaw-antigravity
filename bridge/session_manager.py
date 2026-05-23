@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -21,9 +22,16 @@ from typing import Protocol
 import websockets
 
 
-DEFAULT_BINARY = os.path.expanduser(
-    "/tmp/agy-env/lib/python3.14/site-packages/google/antigravity/bin/localharness"
-)
+def _default_localharness_binary() -> str:
+    spec = importlib.util.find_spec("google.antigravity")
+    if spec and spec.origin:
+        candidate = Path(spec.origin).parent / "bin" / "localharness"
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+DEFAULT_BINARY = _default_localharness_binary()
 SESSION_IDLE_TIMEOUT_SEC = int(os.environ.get("HARNESS_SESSION_IDLE_SEC", "300"))
 REQUEST_TIMEOUT_SEC = float(os.environ.get("HARNESS_REQUEST_TIMEOUT_SEC", "300"))
 MIN_REQUEST_TIMEOUT_SEC = float(os.environ.get("HARNESS_MIN_REQUEST_TIMEOUT_SEC", "1"))
