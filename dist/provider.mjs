@@ -1,30 +1,53 @@
-// Google Harness provider registration
-// Registers google-antigravity as a custom provider backed by the Python bridge
+export const PROVIDER_ID = "google-antigravity";
+export const PROVIDER_LABEL = "Google Harness";
+export const DEFAULT_MODEL = "gemini-3.5-flash";
+export const DEFAULT_PORT = 8080;
+export const LOCAL_API_KEY = "custom-local";
 
-export default {
-  id: "google-antigravity",
-  name: "Google Harness",
-  description: "Gemini models via Antigravity localharness runtime",
-  
-  // Model catalog — models this provider supports
-  catalog: [
-    { id: "gemini-3.5-flash",   context: 1048576,  output: 65536,  aliases: [] },
-    { id: "gemini-3.1-pro",     context: 1048576,  output: 65536,  aliases: ["gemini"] },
-    { id: "gemini-3.1-flash",   context: 1048576,  output: 65536,  aliases: [] },
-  ],
-  
-  // Default model when none specified
-  defaultModel: "gemini-3.5-flash",
-  
-  // Auth: uses Gemini API key, passed through to bridge
-  auth: {
-    type: "apiKey",
-    credentials: ["GEMINI_API_KEY"],
+export const MODELS = [
+  {
+    id: "gemini-3.5-flash",
+    name: "Gemini 3.5 Flash (Harness)",
+    contextTokens: 1048576,
+    maxTokens: 65536,
   },
-  
-  // Onboard config (for `openclaw onboard --google-antigravity`)
-  onboard: {
-    authChoice: "gemini-api-key",
-    defaultModel: "gemini-3.5-flash",
+  {
+    id: "gemini-3.1-pro",
+    name: "Gemini 3.1 Pro (Harness)",
+    contextTokens: 1048576,
+    maxTokens: 65536,
   },
-};
+  {
+    id: "gemini-3.1-flash",
+    name: "Gemini 3.1 Flash (Harness)",
+    contextTokens: 1048576,
+    maxTokens: 65536,
+  },
+];
+
+export function resolveBridgePort(config) {
+  const raw = config?.plugins?.entries?.[PROVIDER_ID]?.port;
+  return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_PORT;
+}
+
+export function resolveBridgeBaseUrl(config) {
+  const configured = config?.models?.providers?.[PROVIDER_ID]?.baseUrl;
+  if (typeof configured === "string" && configured.trim()) {
+    return configured.trim().replace(/\/+$/, "");
+  }
+  return `http://127.0.0.1:${resolveBridgePort(config)}/v1`;
+}
+
+export function buildProviderConfig(config) {
+  const baseUrl = resolveBridgeBaseUrl(config);
+  return {
+    baseUrl,
+    api: "openai-completions",
+    apiKey: LOCAL_API_KEY,
+    models: MODELS.map((model) => ({
+      ...model,
+      api: "openai-completions",
+      baseUrl,
+    })),
+  };
+}

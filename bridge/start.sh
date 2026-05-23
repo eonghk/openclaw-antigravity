@@ -1,10 +1,13 @@
 #!/bin/bash
 # Start google-harness-bridge as a managed daemon
-# Uses /opt/homebrew/bin/python3 for compatibility
+# Uses the Antigravity venv packages via PYTHONPATH.
 
 export HOME="/Users/chen"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PYTHONPATH="/tmp/agy-env/lib/python3.14/site-packages"
+export HARNESS_ADAPTER="${HARNESS_ADAPTER:-real}"
+export HARNESS_PORT="${HARNESS_PORT:-8080}"
+export HARNESS_MODEL="${HARNESS_MODEL:-gemini-3.5-flash}"
 
 # Kill existing if any
 pkill -f "bridge/server.py" 2>/dev/null
