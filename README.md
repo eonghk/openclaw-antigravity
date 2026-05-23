@@ -34,18 +34,52 @@ The npm package owns the OpenClaw provider and CLI. The Python bridge remains a 
 ## Install
 
 ```bash
+npm install -g git+ssh://git@github-personal/eonghk/openclaw-antigravity.git
+openclaw-antigravity install
+openclaw-antigravity doctor
+```
+
+The package is not published to npm yet. After npm publication, the install command will become:
+
+```bash
 npm install -g openclaw-antigravity
-python3 -m venv ~/.openclaw-antigravity
-~/.openclaw-antigravity/bin/pip install google-antigravity
-PYTHON=~/.openclaw-antigravity/bin/python openclaw-antigravity doctor
 ```
 
 Set `GEMINI_API_KEY` in your environment or in `~/.openclaw/openclaw.json` under `env.vars.GEMINI_API_KEY`.
 
 ## Run
 
+On macOS, `install` creates a LaunchAgent:
+
+```
+~/Library/LaunchAgents/com.openclaw.antigravity.plist
+```
+
+It also creates a Python virtual environment at:
+
+```
+~/.openclaw-antigravity/venv
+```
+
+Logs:
+
+```
+~/.openclaw-antigravity/logs/bridge.out.log
+~/.openclaw-antigravity/logs/bridge.err.log
+```
+
+Manage the service:
+
 ```bash
-PYTHON=~/.openclaw-antigravity/bin/python openclaw-antigravity start
+openclaw-antigravity status
+openclaw-antigravity logs
+openclaw-antigravity uninstall
+```
+
+Foreground mode:
+
+```bash
+PYTHON=~/.openclaw-antigravity/venv/bin/python openclaw-antigravity start
 ```
 
 Default bridge URL:
