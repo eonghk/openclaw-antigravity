@@ -98,6 +98,13 @@ Useful environment variables:
 - `HARNESS_SESSION_IDLE_SEC`: session idle timeout
 - `HARNESS_MAX_ACTIVE_SESSIONS`: active session cap
 - `HARNESS_REQUEST_TIMEOUT_SEC`: request timeout
+- `HARNESS_MAX_BODY_BYTES`: maximum HTTP request body, default 32 MiB
+- `HARNESS_CONTEXT_MAX_TOKENS`: hard context packing ceiling, default `1048576`
+- `HARNESS_CONTEXT_CHARS_PER_TOKEN`: rough token estimate for packing, default `4`
+- `HARNESS_CONTEXT_MAX_CHARS`: optional direct character ceiling override
+- `HARNESS_RECENT_MESSAGE_COUNT`: recent message count to prioritize before older history, default `32`
+- `HARNESS_TOOL_OUTPUT_FULL_CHARS`: max preserved tool output before compaction, default 256 KiB
+- `HARNESS_TOOL_OUTPUT_EXCERPT_CHARS`: old/large tool output excerpt size, default `8192`
 
 ## Test
 

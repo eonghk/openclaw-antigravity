@@ -6,15 +6,40 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any
 
 from bridge.session_manager import MAX_REQUEST_TIMEOUT_SEC, MIN_REQUEST_TIMEOUT_SEC, REQUEST_TIMEOUT_SEC, SessionManager
 
-MAX_BODY_BYTES = int(os.environ.get("HARNESS_MAX_BODY_BYTES", "1048576"))
+MAX_BODY_BYTES = int(os.environ.get("HARNESS_MAX_BODY_BYTES", str(32 * 1024 * 1024)))
 REQUEST_READ_TIMEOUT_SEC = float(os.environ.get("HARNESS_REQUEST_READ_TIMEOUT_SEC", "10"))
-HARNESS_CONTEXT_MAX_CHARS = int(os.environ.get("HARNESS_CONTEXT_MAX_CHARS", "25000"))
-HARNESS_CONTEXT_RECENT_CHARS = int(os.environ.get("HARNESS_CONTEXT_RECENT_CHARS", "0"))
+HARNESS_CONTEXT_MAX_TOKENS = int(os.environ.get("HARNESS_CONTEXT_MAX_TOKENS", "1048576"))
+HARNESS_CONTEXT_CHARS_PER_TOKEN = float(os.environ.get("HARNESS_CONTEXT_CHARS_PER_TOKEN", "4"))
+HARNESS_CONTEXT_MAX_CHARS = int(
+    os.environ.get(
+        "HARNESS_CONTEXT_MAX_CHARS",
+        str(int(HARNESS_CONTEXT_MAX_TOKENS * HARNESS_CONTEXT_CHARS_PER_TOKEN)),
+    )
+)
+HARNESS_RECENT_MESSAGE_COUNT = int(os.environ.get("HARNESS_RECENT_MESSAGE_COUNT", "32"))
+HARNESS_TOOL_OUTPUT_FULL_CHARS = int(os.environ.get("HARNESS_TOOL_OUTPUT_FULL_CHARS", str(256 * 1024)))
+HARNESS_TOOL_OUTPUT_EXCERPT_CHARS = int(os.environ.get("HARNESS_TOOL_OUTPUT_EXCERPT_CHARS", "8192"))
+CONTEXT_WRAPPER_CHARS = 2048
+
+
+@dataclass
+class ContextPackStats:
+    total_messages: int
+    packed_messages: int = 0
+    raw_chars: int = 0
+    packed_chars: int = 0
+    compacted_tools: int = 0
+    truncated_messages: int = 0
+
+    @property
+    def estimated_tokens(self) -> int:
+        return int(self.packed_chars / max(HARNESS_CONTEXT_CHARS_PER_TOKEN, 1))
 
 
 def _load_gemini_api_key() -> str:
@@ -103,7 +128,7 @@ async def _handle_chat_completion(
     messages = _normalize_messages(req.get("messages", []))
     last_user_text = _last_user_text(messages)
     last_tool_message = _last_tool_message(messages)
-    harness_input = _build_harness_input(messages, last_user_text)
+    harness_input, pack_stats = _build_harness_input(messages, last_user_text)
     session_id = _resolve_session_id(headers, req)
     workspace_dir = _resolve_workspace_dir(headers, req)
     tools = _normalize_tools(req.get("tools", []))
@@ -113,7 +138,7 @@ async def _handle_chat_completion(
     timeout = _parse_timeout(req.get("timeout", REQUEST_TIMEOUT_SEC))
 
     print(
-        f"[bridge] REQ model={model} stream={stream} session={session_id} workspace={workspace_dir or '-'} messages={len(messages)} roles={','.join(m.get('role','?') for m in messages[-5:])} input_chars={len(harness_input)} tool_response={'yes' if last_tool_message else 'no'} tool_id={(last_tool_message or {}).get('tool_call_id','-')} tool_chars={len((last_tool_message or {}).get('content',''))}",
+        f"[bridge] REQ model={model} stream={stream} session={session_id} workspace={workspace_dir or '-'} messages={len(messages)} roles={','.join(m.get('role','?') for m in messages[-5:])} raw_chars={pack_stats.raw_chars} input_chars={len(harness_input)} packed_messages={pack_stats.packed_messages}/{pack_stats.total_messages} compacted_tools={pack_stats.compacted_tools} truncated={pack_stats.truncated_messages} est_tokens={pack_stats.estimated_tokens}/{HARNESS_CONTEXT_MAX_TOKENS} tool_response={'yes' if last_tool_message else 'no'} tool_id={(last_tool_message or {}).get('tool_call_id','-')} tool_chars={len((last_tool_message or {}).get('content',''))}",
         flush=True,
     )
 
@@ -305,21 +330,27 @@ def _openai_tool_call(call: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_harness_input(messages: list[dict[str, str]], last_user_text: str) -> str:
-    """Package OpenClaw's full turn context for a stateful localharness.
+def _build_harness_input(messages: list[dict[str, str]], last_user_text: str) -> tuple[str, ContextPackStats]:
+    """Package OpenClaw's turn context for a stateful localharness.
 
-    OpenClaw has already injected agent files, memory, skills, and channel
-    history into the chat-completions messages. localharness only accepts a
-    user input event here, so preserve that injected context as an explicit
-    preamble and put the latest user turn at the end.
+    The provider advertises a large context window, so the bridge should not
+    hide that behind a tiny fixed prompt cap. It still has to assemble context
+    structurally because replaying unbounded channel history and old tool dumps
+    as one user event is wasteful and can time out before localharness responds.
     """
+    stats = ContextPackStats(
+        total_messages=len(messages),
+        raw_chars=sum(len(msg.get("content") or "") for msg in messages),
+    )
     if len(messages) <= 1:
-        return last_user_text
-    context_messages = _select_context_messages(messages)
+        stats.packed_messages = len(messages)
+        stats.packed_chars = len(last_user_text)
+        return last_user_text, stats
+    context_messages = _select_context_messages(messages, last_user_text, stats)
     parts = [
-        "You are receiving the complete OpenClaw turn context for this request.",
+        "You are receiving the packed OpenClaw turn context for this request.",
         "Use system/developer/context messages as current instructions and answer only the latest user message.",
-        "Older transcript messages are not replayed here because localharness is stateful; use the supplied agent files and memory plus the latest user message.",
+        "The bridge preserves high-value structure first and compacts old oversized tool outputs when needed.",
         "",
         "<openclaw_messages>",
     ]
@@ -335,39 +366,134 @@ def _build_harness_input(messages: list[dict[str, str]], last_user_text: str) ->
         "Latest user message:",
         last_user_text,
     ])
-    return "\n\n".join(parts)
+    harness_input = "\n\n".join(parts)
+    stats.packed_chars = len(harness_input)
+    return harness_input, stats
 
 
-def _select_context_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep injected instructions plus a bounded recent transcript.
-
-    Discord/Slack channel sessions can accumulate hundreds of messages and huge
-    tool outputs. Passing all of that through localharness as a single user input
-    makes real turns time out. OpenClaw already injects the current agent files
-    and memory near the front of the request, so preserve those high-value
-    system/developer messages and then append the freshest conversational turns.
-    """
+def _select_context_messages(
+    messages: list[dict[str, str]],
+    last_user_text: str,
+    stats: ContextPackStats,
+) -> list[dict[str, str]]:
+    """Pack by message structure, never by keyword or guessed intent."""
     if not messages:
         return []
 
-    head: list[dict[str, str]] = []
-    head_chars = 0
-    for msg in messages:
-        role = msg.get("role") or ""
-        content = msg.get("content") or ""
-        if role not in {"system", "developer"}:
-            continue
-        if not content:
-            continue
-        if head_chars + len(content) > max(1000, HARNESS_CONTEXT_MAX_CHARS - HARNESS_CONTEXT_RECENT_CHARS):
-            remaining = max(0, HARNESS_CONTEXT_MAX_CHARS - HARNESS_CONTEXT_RECENT_CHARS - head_chars)
-            if remaining > 1000:
-                head.append({"role": role, "content": content[:remaining] + "\n[...truncated...]"})
-            break
-        head.append(msg)
-        head_chars += len(content)
+    latest_user_idx = _latest_user_index(messages)
+    budget = max(0, HARNESS_CONTEXT_MAX_CHARS - len(last_user_text) - CONTEXT_WRAPPER_CHARS)
+    selected: dict[int, dict[str, str]] = {}
+    used_chars = 0
 
-    return head or messages[:1]
+    def add_message(index: int, mode: str = "auto") -> None:
+        nonlocal used_chars
+        if index in selected or index == latest_user_idx:
+            return
+        remaining = budget - used_chars
+        if remaining <= 0:
+            return
+        packed = _render_context_message(messages[index], remaining, mode)
+        if packed is None:
+            return
+        selected[index] = packed
+        used_chars += len(packed.get("content") or "")
+        if packed.get("_compacted") == "true":
+            stats.compacted_tools += 1
+        if packed.get("_truncated") == "true":
+            stats.truncated_messages += 1
+
+    # Current instructions and injected runtime context have the highest value.
+    for index, msg in enumerate(messages):
+        if msg.get("role") in {"system", "developer"}:
+            add_message(index, "preserve")
+
+    # Preserve the active tool-result chain at the tail so tool continuation works.
+    for index in range(_current_tool_chain_start(messages, latest_user_idx), len(messages)):
+        add_message(index, "preserve")
+
+    # Keep the newest ordinary turns before considering older history.
+    recent_start = max(0, len(messages) - max(HARNESS_RECENT_MESSAGE_COUNT, 0))
+    for index in range(recent_start, len(messages)):
+        add_message(index, "recent")
+
+    # Fill the remaining hard window with older turns, newest first.
+    for index in range(recent_start - 1, -1, -1):
+        add_message(index, "old")
+
+    stats.packed_messages = len(selected)
+    return [selected[index] for index in sorted(selected)]
+
+
+def _latest_user_index(messages: list[dict[str, str]]) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
+    return -1
+
+
+def _current_tool_chain_start(messages: list[dict[str, str]], latest_user_idx: int) -> int:
+    if not messages or messages[-1].get("role") not in {"tool", "toolResult", "function"}:
+        return len(messages)
+    start = max(latest_user_idx + 1, 0)
+    for index in range(len(messages) - 1, start - 1, -1):
+        if messages[index].get("role") == "assistant":
+            return index
+    return start
+
+
+def _render_context_message(msg: dict[str, str], remaining_chars: int, mode: str) -> dict[str, str] | None:
+    role = msg.get("role") or "unknown"
+    content = msg.get("content") or ""
+    if not content:
+        return None
+
+    tool_like = role in {"tool", "toolResult", "function"}
+    if tool_like and (mode == "old" or len(content) > HARNESS_TOOL_OUTPUT_FULL_CHARS):
+        return _compact_tool_message(msg, remaining_chars)
+
+    return _fit_message(msg, remaining_chars)
+
+
+def _fit_message(msg: dict[str, str], remaining_chars: int) -> dict[str, str] | None:
+    content = msg.get("content") or ""
+    if remaining_chars <= 0:
+        return None
+    if len(content) <= remaining_chars:
+        return dict(msg)
+    if remaining_chars < 512:
+        return None
+    packed = dict(msg)
+    packed["content"] = _middle_excerpt(content, remaining_chars, "message truncated")
+    packed["_truncated"] = "true"
+    return packed
+
+
+def _compact_tool_message(msg: dict[str, str], remaining_chars: int) -> dict[str, str] | None:
+    content = msg.get("content") or ""
+    if remaining_chars < 512:
+        return None
+    tool_call_id = msg.get("tool_call_id") or "-"
+    header = f"[tool output compacted; original_chars={len(content)}; tool_call_id={tool_call_id}]"
+    excerpt_budget = min(HARNESS_TOOL_OUTPUT_EXCERPT_CHARS, remaining_chars - len(header) - 32)
+    if excerpt_budget < 256:
+        return None
+    packed = dict(msg)
+    packed["content"] = f"{header}\n{_middle_excerpt(content, excerpt_budget, 'tool output excerpt')}"
+    packed["_compacted"] = "true"
+    if len(content) > excerpt_budget:
+        packed["_truncated"] = "true"
+    return packed
+
+
+def _middle_excerpt(text: str, max_chars: int, label: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    marker = f"\n[...{label}; omitted_chars={len(text) - max_chars}...]\n"
+    if max_chars <= len(marker) + 2:
+        return text[:max_chars]
+    edge = max(1, (max_chars - len(marker)) // 2)
+    tail = max_chars - len(marker) - edge
+    return text[:edge] + marker + text[-tail:]
 
 
 def _resolve_session_id(headers: dict[str, str], req: dict[str, Any]) -> str:

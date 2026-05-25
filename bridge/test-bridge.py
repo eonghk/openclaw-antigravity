@@ -13,6 +13,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bridge import server as bridge_server
 
 
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8080")
@@ -232,6 +236,43 @@ def test_full_context_is_forwarded():
     assert result["text"] == "CONTEXT_OK", result
 
 
+def test_context_packer_compacts_old_tool_output():
+    old_tool_output = "tool-start\n" + ("x" * 50000) + "\ntool-end"
+    messages = [
+        {"role": "system", "content": "System instructions stay available."},
+        {"role": "user", "content": "Old request"},
+        {"role": "tool", "tool_call_id": "call_old", "content": old_tool_output},
+        {"role": "assistant", "content": "Old answer"},
+    ]
+    for index in range(bridge_server.HARNESS_RECENT_MESSAGE_COUNT + 2):
+        messages.append({"role": "user", "content": f"filler-{index}"})
+        messages.append({"role": "assistant", "content": f"filler-answer-{index}"})
+    messages.append({"role": "user", "content": "Reply with exactly: PACK_OK"})
+    harness_input, stats = bridge_server._build_harness_input(
+        messages,
+        "Reply with exactly: PACK_OK",
+    )
+    assert "System instructions stay available." in harness_input, harness_input
+    assert "Latest user message:\n\nReply with exactly: PACK_OK" in harness_input, harness_input
+    assert "tool output compacted" in harness_input, harness_input
+    assert "tool-start" in harness_input and "tool-end" in harness_input, harness_input
+    assert len(harness_input) < len(old_tool_output), len(harness_input)
+    assert stats.compacted_tools >= 1, stats
+
+
+def test_context_packer_uses_large_hard_window():
+    messages = [{"role": "system", "content": "system-context"}]
+    for index in range(40):
+        messages.append({"role": "user", "content": f"old-user-{index} " + ("u" * 1000)})
+        messages.append({"role": "assistant", "content": f"old-assistant-{index} " + ("a" * 1000)})
+    messages.append({"role": "user", "content": "Reply with exactly: HARD_WINDOW_OK"})
+    harness_input, stats = bridge_server._build_harness_input(messages, "Reply with exactly: HARD_WINDOW_OK")
+    assert "old-user-0" in harness_input, harness_input
+    assert "old-assistant-39" in harness_input, harness_input
+    assert "Latest user message:\n\nReply with exactly: HARD_WINDOW_OK" in harness_input, harness_input
+    assert stats.truncated_messages == 0, stats
+
+
 def test_timeout_does_not_poison_session():
     timed_out = chat(
         [{"role": "user", "content": "sleep:1.2 Reply with exactly: TOO_LATE"}],
@@ -292,6 +333,8 @@ if __name__ == "__main__":
         test_slow_same_session_does_not_block_other_session,
         test_content_parts_and_empty,
         test_full_context_is_forwarded,
+        test_context_packer_compacts_old_tool_output,
+        test_context_packer_uses_large_hard_window,
         test_timeout_does_not_poison_session,
         test_missing_session_id_rejected,
         test_invalid_timeout_rejected,
